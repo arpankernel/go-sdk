@@ -1544,7 +1544,7 @@ func (s streamableRequest) do(ctx context.Context, serverURL, sessionID string, 
 	var respBody []byte
 	if contentType == "text/event-stream" {
 		r := readerInto{resp.Body, new(bytes.Buffer)}
-		for evt, err := range scanEvents(r) {
+		for evt, err := range scanEventsLimited(r, DefaultMaxEventSize) {
 			if err != nil {
 				return newSessionID, resp.StatusCode, nil, fmt.Errorf("reading events: %v", err)
 			}
@@ -2856,6 +2856,69 @@ data: {"jsonrpc":"2.0","id":1,"result":{}}
 	}
 }
 
+// TestProcessStreamMaxEventSize verifies that a streamableClientConn honors its
+// configured maxEventSize.
+func TestProcessStreamMaxEventSize(t *testing.T) {
+	jsonrpcEventOfSize := func(padSize int) string {
+		msg := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":{"pad":%q}}`, strings.Repeat("A", padSize))
+		return "data: " + msg + "\n\n"
+	}
+
+	tests := []struct {
+		name         string
+		maxEventSize int
+		event        string
+		wantFail     bool
+	}{
+		{
+			name:         "event over cap is rejected",
+			event:        jsonrpcEventOfSize(4096),
+			maxEventSize: 1024,
+			wantFail:     true,
+		},
+		{
+			name:         "event under cap is accepted",
+			event:        jsonrpcEventOfSize(1024),
+			maxEventSize: 4096,
+			wantFail:     false,
+		},
+		{
+			name:         "negative cap disables the limit",
+			event:        jsonrpcEventOfSize(4096),
+			maxEventSize: -1,
+			wantFail:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tt.event)),
+			}
+			conn := &streamableClientConn{
+				ctx:          ctx,
+				done:         make(chan struct{}),
+				incoming:     make(chan jsonrpc.Message, 10),
+				failed:       make(chan struct{}),
+				logger:       ensureLogger(nil),
+				maxEventSize: tt.maxEventSize,
+			}
+			conn.processStream(ctx, "test", resp, nil)
+
+			err := conn.failure()
+			if tt.wantFail && err == nil {
+				t.Fatal("failure() = nil, want a non-nil error for an oversized event")
+			}
+			if !tt.wantFail && err != nil {
+				t.Fatalf("failure() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestScanEventsPingFiltering is a unit test for the low-level event scanning
 // with ping events to verify scanEvents properly parses all event types.
 func TestScanEventsPingFiltering(t *testing.T) {
@@ -2878,7 +2941,7 @@ data: {"jsonrpc":"2.0","method":"test2","params":{}}
 	var events []Event
 
 	// Scan all events
-	for evt, err := range scanEvents(reader) {
+	for evt, err := range scanEventsLimited(reader, DefaultMaxEventSize) {
 		if err != nil {
 			if err != io.EOF {
 				t.Fatalf("scanEvents error: %v", err)
@@ -3709,6 +3772,126 @@ func TestStreamableStateless_AcceptsNewProtocol(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, respBody)
+	}
+}
+
+// TestStreamableStateless_NotificationMetaValidation checks that the SEP-2575
+// per-request `_meta` triple is required of calls only. NotificationParams
+// declares `_meta` optional with no protocolVersion, so a notification that
+// omits it is well-formed and must be accepted with 202.
+func TestStreamableStateless_NotificationMetaValidation(t *testing.T) {
+	newProtocolMeta := map[string]any{
+		MetaKeyProtocolVersion:    protocolVersion20260728,
+		MetaKeyClientInfo:         map[string]any{"name": "new-proto-client", "version": "9.9"},
+		MetaKeyClientCapabilities: map[string]any{},
+	}
+
+	tests := []struct {
+		name       string
+		message    map[string]any
+		wantStatus int
+	}{
+		{
+			name: "cancelled without meta",
+			message: map[string]any{
+				"jsonrpc": "2.0",
+				"method":  notificationCancelled,
+				"params":  map[string]any{"requestID": 1, "reason": "context canceled"},
+			},
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name: "progress without meta",
+			message: map[string]any{
+				"jsonrpc": "2.0",
+				"method":  notificationProgress,
+				"params":  map[string]any{"progressToken": "t", "progress": 1},
+			},
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name: "notification with matching meta",
+			message: map[string]any{
+				"jsonrpc": "2.0",
+				"method":  notificationCancelled,
+				"params": map[string]any{
+					"_meta":     newProtocolMeta,
+					"requestID": 1,
+				},
+			},
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			// A notification that volunteers a version is still held to the
+			// header-match rule, so relaxing the requirement does not open a
+			// hole for inconsistent messages.
+			name: "notification with mismatched meta",
+			message: map[string]any{
+				"jsonrpc": "2.0",
+				"method":  notificationCancelled,
+				"params": map[string]any{
+					"_meta": map[string]any{
+						MetaKeyProtocolVersion:    "2025-06-18",
+						MetaKeyClientCapabilities: map[string]any{},
+					},
+					"requestID": 1,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// Calls remain subject to the requirement.
+			name: "call without meta",
+			message: map[string]any{
+				"jsonrpc": "2.0",
+				"id":      1,
+				"method":  "tools/list",
+				"params":  map[string]any{},
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	server := NewServer(testImpl, nil)
+	AddTool(server, &Tool{Name: "noop"},
+		func(ctx context.Context, req *CallToolRequest, args struct{}) (*CallToolResult, any, error) {
+			return &CallToolResult{Content: []Content{&TextContent{Text: "ok"}}}, nil, nil
+		})
+	handler := NewStreamableHTTPHandler(
+		func(*http.Request) *Server { return server },
+		&StreamableHTTPOptions{Stateless: true},
+	)
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := json.Marshal(test.message)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodPost, httpServer.URL, bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set(protocolVersionHeader, protocolVersion20260728)
+			req.Header.Set(methodHeader, test.message["method"].(string))
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			respBody, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", resp.StatusCode, test.wantStatus, respBody)
+			}
+			if test.wantStatus == http.StatusAccepted && len(respBody) > 0 {
+				t.Errorf("accepted notification returned body %q, want empty", respBody)
+			}
+		})
 	}
 }
 
