@@ -1438,7 +1438,15 @@ func (c *streamableServerConn) acquireStream(ctx context.Context, w http.Respons
 //
 // It returns an HTTP status code and error message.
 func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Request) {
-	if len(req.Header.Values(lastEventIDHeader)) > 0 {
+	protocolVersion := protocolVersionFromContext(req.Context())
+	if protocolVersion == "" {
+		protocolVersion = protocolVersion20250326
+	}
+
+	// Last-Event-ID has no meaning on a POST. Before 2026-07-28 it is rejected;
+	// that revision removed resumable streams, so a leftover header from an
+	// older client is ignored rather than failing the request.
+	if protocolVersion < protocolVersion20260728 && len(req.Header.Values(lastEventIDHeader)) > 0 {
 		http.Error(w, "can't send Last-Event-ID for POST request", http.StatusBadRequest)
 		return
 	}
@@ -1465,11 +1473,6 @@ func (c *streamableServerConn) servePOST(w http.ResponseWriter, req *http.Reques
 	if err != nil {
 		http.Error(w, fmt.Sprintf("malformed payload: %v", err), http.StatusBadRequest)
 		return
-	}
-
-	protocolVersion := protocolVersionFromContext(req.Context())
-	if protocolVersion == "" {
-		protocolVersion = protocolVersion20250326
 	}
 
 	if isBatch && protocolVersion >= protocolVersion20250618 {

@@ -4264,3 +4264,48 @@ func TestStreamableSupportedProtocolVersions_Header(t *testing.T) {
 		}
 	})
 }
+
+// TestStreamablePOSTLastEventID verifies that a POST carrying a Last-Event-ID
+// header is rejected before 2026-07-28 but ignored on 2026-07-28, where
+// resumable streams were removed. Regression test for #1233.
+func TestStreamablePOSTLastEventID(t *testing.T) {
+	server := NewServer(testImpl, nil)
+	handler := NewStreamableHTTPHandler(func(*http.Request) *Server { return server }, nil)
+	httpServer := httptest.NewServer(mustNotPanic(t, handler))
+	defer httpServer.Close()
+
+	const rejection = "can't send Last-Event-ID"
+	tests := []struct {
+		name            string
+		protocolVersion string
+		wantRejected    bool
+	}{
+		{"2026-07-28 ignores Last-Event-ID", protocolVersion20260728, false},
+		{"pre-2026-07-28 rejects Last-Event-ID", protocolVersion20251125, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := jsonBody(t, req(1, "ping", nil))
+			r, err := http.NewRequest("POST", httpServer.URL, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Accept", "application/json, text/event-stream")
+			r.Header.Set(protocolVersionHeader, tt.protocolVersion)
+			r.Header.Set(lastEventIDHeader, "42")
+
+			resp, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+
+			if got := strings.Contains(string(b), rejection); got != tt.wantRejected {
+				t.Errorf("Last-Event-ID rejected = %v, want %v (status %d, body %q)",
+					got, tt.wantRejected, resp.StatusCode, strings.TrimSpace(string(b)))
+			}
+		})
+	}
+}
